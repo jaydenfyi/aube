@@ -331,6 +331,12 @@
       "exit_code": 91
     },
     {
+      "name": "ERR_AUBE_UNSAFE_PACKAGE_NAME",
+      "category": "Misc / safety",
+      "description": "A package/dependency alias would escape its `node_modules` slot if linked.",
+      "exit_code": 92
+    },
+    {
       "name": "ERR_AUBE_PATCHES_TRACKING_WRITE",
       "category": "Misc / safety",
       "description": "Couldn't write `.aube-applied-patches.json` after applying patches. Non-fatal; next install may miss stale patched entries.",
