@@ -26,9 +26,30 @@
 //! gives us alphabetized keys for free. BLAKE3 is the project default
 //! for non-crypto-verifying hashes (3-5x faster than SHA-256).
 
-use crate::{LockedPackage, LockfileGraph};
+use crate::{LockedPackage, LockfileGraph, shared_local_dep_path};
 use serde::Serialize;
 use std::collections::BTreeMap;
+
+/// Resolve a child dependency's recorded `(alias, tail)` to the graph
+/// key the target package is stored under.
+///
+/// Registry deps record their version verbatim, so `alias@tail` is the
+/// key. Git / remote-tarball deps record their *resolved URL* as the
+/// tail while the package is keyed under the hashed
+/// `alias@git+<hash>` / `alias@url+<hash>` form; [`shared_local_dep_path`]
+/// performs that translation. Falling back to the raw `alias@tail`
+/// keeps the common case allocation-light and behaves identically to
+/// the pre-canonicalization lookup for everything that isn't a
+/// content-pinned source.
+///
+/// Keeping this in lockstep with the linker's sibling-symlink keying
+/// (which calls the same helper) is load-bearing: if the hasher skipped
+/// a URL-shaped git child, the parent's GVS hash would omit that child's
+/// content fingerprint and build/engine taint, and two materially
+/// different trees would collide on one virtual-store path.
+fn child_dep_path(alias: &str, tail: &str) -> String {
+    shared_local_dep_path(alias, tail).unwrap_or_else(|| format!("{alias}@{tail}"))
+}
 
 use aube_util::collections::FxMap as FxHashMap;
 use aube_util::collections::FxSet as FxHashSet;
@@ -122,6 +143,22 @@ fn append_hex_to_leaf(dep_path: &str, hex: &str) -> String {
 /// package also lands at a fresh virtual-store path.
 pub type PatchHashFn<'a> = &'a dyn Fn(&str, &str) -> Option<String>;
 
+/// Per-`dep_path` materialized-content fingerprint. Folded into
+/// `full_pkg_id` so a source-backed dependency (git / remote tarball)
+/// whose lockfile coordinate is identical to another's but whose
+/// on-disk bytes differ hashes to a distinct value.
+///
+/// The motivating case is a git dep installed once normally (its
+/// `prepare` built `dist/`) and once under `--ignore-scripts` (raw
+/// checkout): same `<url>#<commit>` coordinate, no integrity in the
+/// lockfile, but different trees. Keying the global virtual store by
+/// coordinate alone would let the first project's built tree leak into
+/// the second's scripts-free install; folding the content fingerprint
+/// in keeps them at separate paths. Returns `None` for packages whose
+/// content the caller doesn't fingerprint (registry packages already
+/// carry an integrity, so they need no extra disambiguation).
+pub type ContentHashFn<'a> = &'a dyn Fn(&str) -> Option<String>;
+
 /// Compute final hashes for every package in `graph`. When
 /// `engine` is `Some`, packages whose transitive subtree contains a
 /// build-allowed package fold the engine name into their hash; when
@@ -144,6 +181,21 @@ pub fn compute_graph_hashes_with_patches(
     engine: Option<&EngineName>,
     patch_hash: PatchHashFn<'_>,
 ) -> GraphHashes {
+    compute_graph_hashes_full(graph, allow_build, engine, patch_hash, &|_| None)
+}
+
+/// Variant of [`compute_graph_hashes_with_patches`] that additionally
+/// folds a per-`dep_path` materialized-content fingerprint into each
+/// node's identity. See [`ContentHashFn`] for why this is needed for
+/// source-backed (git / remote-tarball) dependencies under the global
+/// virtual store.
+pub fn compute_graph_hashes_full(
+    graph: &LockfileGraph,
+    allow_build: AllowBuildFn<'_>,
+    engine: Option<&EngineName>,
+    patch_hash: PatchHashFn<'_>,
+    content_hash: ContentHashFn<'_>,
+) -> GraphHashes {
     // Pass 1: identify every dep_path whose `(name, version)` is
     // allowed to run its scripts. This is the "builds" set.
     let mut builds: FxHashSet<String> = FxHashSet::default();
@@ -162,6 +214,7 @@ pub fn compute_graph_hashes_with_patches(
             &mut deps_hash_cache,
             &mut FxHashSet::default(),
             patch_hash,
+            content_hash,
         );
     }
 
@@ -213,6 +266,7 @@ fn calc_deps_hash(
     cache: &mut FxHashMap<String, String>,
     parents: &mut FxHashSet<String>,
     patch_hash: PatchHashFn<'_>,
+    content_hash: ContentHashFn<'_>,
 ) -> String {
     if let Some(cached) = cache.get(dep_path) {
         return cached.clone();
@@ -227,17 +281,24 @@ fn calc_deps_hash(
 
     let hash = match graph.packages.get(dep_path) {
         Some(pkg) => {
-            let id = full_pkg_id(pkg, patch_hash);
+            let id = full_pkg_id(pkg, patch_hash, content_hash(dep_path).as_deref());
             let mut deps: BTreeMap<String, String> = BTreeMap::new();
             for (alias, child_tail) in &pkg.dependencies {
-                let child_dep_path = format!("{alias}@{child_tail}");
+                let child_dep_path = child_dep_path(alias, child_tail);
                 // The child might not be in the graph if the lockfile
                 // has a dangling reference (e.g. after manual edits);
                 // skip rather than panic.
                 if !graph.packages.contains_key(&child_dep_path) {
                     continue;
                 }
-                let child_hash = calc_deps_hash(graph, &child_dep_path, cache, parents, patch_hash);
+                let child_hash = calc_deps_hash(
+                    graph,
+                    &child_dep_path,
+                    cache,
+                    parents,
+                    patch_hash,
+                    content_hash,
+                );
                 deps.insert(alias.clone(), child_hash);
             }
             hash_canonical(&DepsHashInput {
@@ -274,7 +335,7 @@ fn transitively_requires_build(
     }
     let result = match graph.packages.get(dep_path) {
         Some(pkg) => pkg.dependencies.iter().any(|(alias, tail)| {
-            let child_dep_path = format!("{alias}@{tail}");
+            let child_dep_path = child_dep_path(alias, tail);
             transitively_requires_build(graph, builds, &child_dep_path, cache, parents)
         }),
         None => false,
@@ -285,23 +346,31 @@ fn transitively_requires_build(
 }
 
 /// `full_pkg_id` — pnpm uses `${pkgIdWithPatchHash}:${resolution}`; we
-/// use `${name}@${version}[:patch:<hex>]:${source?}:${integrity}`.
+/// use `${name}@${version}[:patch:<hex>]:${source?}[:content:<hex>]:${integrity}`.
 /// Source-backed packages fold in their stable specifier so two local
 /// or git dependencies with the same manifest version don't collapse
 /// onto the same graph hash when they point at different bytes.
-fn full_pkg_id(pkg: &LockedPackage, patch_hash: PatchHashFn<'_>) -> String {
+///
+/// `content` is the materialized-content fingerprint (see
+/// [`ContentHashFn`]). It disambiguates source-backed deps that share a
+/// coordinate but not bytes — e.g. a git dep whose `prepare` ran versus
+/// the same commit installed under `--ignore-scripts`.
+fn full_pkg_id(pkg: &LockedPackage, patch_hash: PatchHashFn<'_>, content: Option<&str>) -> String {
     let integrity = pkg.integrity.as_deref().unwrap_or("<no-integrity>");
     let source = pkg
         .local_source
         .as_ref()
         .map(|source| format!(":source:{}", source.specifier()))
         .unwrap_or_default();
+    let content = content
+        .map(|hex| format!(":content:{hex}"))
+        .unwrap_or_default();
     match patch_hash(&pkg.name, &pkg.version) {
         Some(hex) => format!(
-            "{}@{}:patch:{hex}{source}:{integrity}",
+            "{}@{}:patch:{hex}{source}{content}:{integrity}",
             pkg.name, pkg.version
         ),
-        None => format!("{}@{}{source}:{}", pkg.name, pkg.version, integrity),
+        None => format!("{}@{}{source}{content}:{integrity}", pkg.name, pkg.version),
     }
 }
 
@@ -472,6 +541,169 @@ mod tests {
         );
         // `pure` has no build in its subtree → engine-agnostic → stable
         assert_eq!(h_a.node_hash["pure@1.0.0"], h_b.node_hash["pure@1.0.0"]);
+    }
+
+    #[test]
+    fn content_hash_disambiguates_same_coordinate() {
+        // A git dep with no integrity: two installs share the same
+        // `(name, version, source)` coordinate but materialize
+        // different trees (prepare ran vs `--ignore-scripts`). Folding
+        // the content fingerprint in must split them onto distinct
+        // hashes; an absent fingerprint must leave the hash unchanged.
+        let mut g = empty_graph();
+        let mut pkg = mk_pkg("gitdep", "1.0.0", None);
+        pkg.dep_path = "gitdep@git+abc".into();
+        pkg.local_source = Some(LocalSource::Directory(PathBuf::from("clone")));
+        g.packages.insert("gitdep@git+abc".into(), pkg);
+
+        let none = compute_graph_hashes_full(&g, &|_| false, None, &|_, _| None, &|_| None);
+        let prepared = compute_graph_hashes_full(&g, &|_| false, None, &|_, _| None, &|dp| {
+            (dp == "gitdep@git+abc").then(|| "prepared".to_string())
+        });
+        let raw = compute_graph_hashes_full(&g, &|_| false, None, &|_, _| None, &|dp| {
+            (dp == "gitdep@git+abc").then(|| "raw".to_string())
+        });
+
+        assert_ne!(
+            prepared.node_hash["gitdep@git+abc"], raw.node_hash["gitdep@git+abc"],
+            "different content fingerprints must produce different hashes"
+        );
+        assert_ne!(
+            none.node_hash["gitdep@git+abc"], prepared.node_hash["gitdep@git+abc"],
+            "folding in a fingerprint must change the hash vs none"
+        );
+        // A no-op content fn reproduces the with-patches result exactly,
+        // so existing GVS paths for the common case stay stable.
+        let with_patches = compute_graph_hashes_with_patches(&g, &|_| false, None, &|_, _| None);
+        assert_eq!(none.node_hash, with_patches.node_hash);
+    }
+
+    #[test]
+    fn content_hash_cascades_to_parent() {
+        // A parent that depends on the fingerprinted git dep must also
+        // get a fresh hash, so its sibling symlink lands on the dep's
+        // content-disambiguated path rather than dangling.
+        let mut g = empty_graph();
+        let mut parent = mk_pkg("parent", "1.0.0", Some("sha512-P"));
+        parent
+            .dependencies
+            .insert("gitdep".into(), "git+abc".into());
+        g.packages.insert("parent@1.0.0".into(), parent);
+        let mut child = mk_pkg("gitdep", "1.0.0", None);
+        child.dep_path = "gitdep@git+abc".into();
+        child.local_source = Some(LocalSource::Directory(PathBuf::from("clone")));
+        g.packages.insert("gitdep@git+abc".into(), child);
+
+        let a = compute_graph_hashes_full(&g, &|_| false, None, &|_, _| None, &|dp| {
+            (dp == "gitdep@git+abc").then(|| "prepared".to_string())
+        });
+        let b = compute_graph_hashes_full(&g, &|_| false, None, &|_, _| None, &|dp| {
+            (dp == "gitdep@git+abc").then(|| "raw".to_string())
+        });
+        assert_ne!(a.node_hash["parent@1.0.0"], b.node_hash["parent@1.0.0"]);
+    }
+
+    const URL_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn url_shaped_git_child_content_cascades_to_parent() {
+        // Real pnpm lockfiles record a git dependency by its *resolved
+        // URL* in the parent's `dependencies:` map, while the package is
+        // keyed under the hashed `name@git+<hash>` form. The hasher must
+        // canonicalize that URL-shaped value — a raw `name@<url>` lookup
+        // misses the child, so its content fingerprint never reaches the
+        // parent and two materially different trees collide on one GVS
+        // path. (Distinct from `content_hash_cascades_to_parent`, which
+        // feeds the already-canonical synthetic `git+abc` value.)
+        let url = format!("https://github.com/request/request.git#{URL_SHA}");
+        let child_key = shared_local_dep_path("request", &url).expect("git url is shareable");
+        assert!(
+            child_key.starts_with("request@git+"),
+            "unexpected: {child_key}"
+        );
+
+        let mut g = empty_graph();
+        let mut parent = mk_pkg("parent", "1.0.0", Some("sha512-P"));
+        parent.dependencies.insert("request".into(), url);
+        g.packages.insert("parent@1.0.0".into(), parent);
+        let mut child = mk_pkg("request", "2.88.0", None);
+        child.dep_path = child_key.clone();
+        child.local_source = Some(LocalSource::Directory(PathBuf::from("clone")));
+        g.packages.insert(child_key.clone(), child);
+
+        let prepared = compute_graph_hashes_full(&g, &|_| false, None, &|_, _| None, &|dp| {
+            (dp == child_key.as_str()).then(|| "prepared".to_string())
+        });
+        let raw = compute_graph_hashes_full(&g, &|_| false, None, &|_, _| None, &|dp| {
+            (dp == child_key.as_str()).then(|| "raw".to_string())
+        });
+        assert_ne!(
+            prepared.node_hash["parent@1.0.0"], raw.node_hash["parent@1.0.0"],
+            "URL-shaped git child fingerprint must cascade into the parent hash"
+        );
+    }
+
+    #[test]
+    fn url_shaped_tarball_child_content_cascades_to_parent() {
+        // The codeload-archive form pnpm records for a `github:` dep that
+        // resolves to a tarball. Keyed under `name@url+<hash>`; the raw
+        // `name@<url>` lookup would skip it just like the git case.
+        let url = format!("https://codeload.github.com/request/request/tar.gz/{URL_SHA}");
+        let child_key = shared_local_dep_path("request", &url).expect("tarball url is shareable");
+        assert!(
+            child_key.starts_with("request@url+"),
+            "unexpected: {child_key}"
+        );
+
+        let mut g = empty_graph();
+        let mut parent = mk_pkg("parent", "1.0.0", Some("sha512-P"));
+        parent.dependencies.insert("request".into(), url);
+        g.packages.insert("parent@1.0.0".into(), parent);
+        let mut child = mk_pkg("request", "2.88.0", None);
+        child.dep_path = child_key.clone();
+        child.local_source = Some(LocalSource::Directory(PathBuf::from("clone")));
+        g.packages.insert(child_key.clone(), child);
+
+        let prepared = compute_graph_hashes_full(&g, &|_| false, None, &|_, _| None, &|dp| {
+            (dp == child_key.as_str()).then(|| "prepared".to_string())
+        });
+        let raw = compute_graph_hashes_full(&g, &|_| false, None, &|_, _| None, &|dp| {
+            (dp == child_key.as_str()).then(|| "raw".to_string())
+        });
+        assert_ne!(
+            prepared.node_hash["parent@1.0.0"], raw.node_hash["parent@1.0.0"],
+            "URL-shaped tarball child fingerprint must cascade into the parent hash"
+        );
+    }
+
+    #[test]
+    fn url_shaped_git_child_engine_taint_cascades_to_parent() {
+        // An allowlisted (building) git child recorded by URL must make
+        // the parent engine-sensitive too; otherwise a parent installed
+        // under a different engine reuses a GVS path built for the wrong
+        // ABI. Requires the same canonical child lookup in
+        // `transitively_requires_build`.
+        let url = format!("https://github.com/request/request.git#{URL_SHA}");
+        let child_key = shared_local_dep_path("request", &url).expect("git url is shareable");
+
+        let mut g = empty_graph();
+        let mut parent = mk_pkg("parent", "1.0.0", Some("sha512-P"));
+        parent.dependencies.insert("request".into(), url);
+        g.packages.insert("parent@1.0.0".into(), parent);
+        let mut child = mk_pkg("request", "2.88.0", None);
+        child.dep_path = child_key.clone();
+        child.local_source = Some(LocalSource::Directory(PathBuf::from("clone")));
+        g.packages.insert(child_key, child);
+
+        let allow_request = |pkg: &LockedPackage| pkg.registry_name() == "request";
+        let engine_a = EngineName("linux-x64-node20".into());
+        let engine_b = EngineName("linux-x64-node22".into());
+        let h_a = compute_graph_hashes(&g, &allow_request, Some(&engine_a));
+        let h_b = compute_graph_hashes(&g, &allow_request, Some(&engine_b));
+        assert_ne!(
+            h_a.node_hash["parent@1.0.0"], h_b.node_hash["parent@1.0.0"],
+            "URL-shaped building git child must make the parent engine-sensitive"
+        );
     }
 
     #[test]
