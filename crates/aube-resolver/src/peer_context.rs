@@ -1617,14 +1617,32 @@ fn visit_peer_context<'g>(
                 .map(|(_, tail)| tail)
         };
 
-        if let Some(version) = from_ancestor
-            .or(from_pkg_deps)
-            .or(from_ancestor_incompatible)
-            .or(from_pkg_deps_incompatible)
-            .or(from_root)
-            .or_else(from_graph_scan)
-            .or(from_root_incompatible)
-        {
+        // pnpm resolves an *optional* peer (one flagged
+        // `peerDependenciesMeta.optional`) only from the resolution path it
+        // is actually on — the nearest ancestor, the package's own
+        // auto-installed deps, or the workspace root — and otherwise leaves
+        // it unresolved so it surfaces under `transitivePeerDependencies`.
+        // It never reaches for a range-incompatible version or scans the
+        // whole graph for an unrelated copy. Mirroring that is what lets
+        // `typescript` (an optional peer the root provides) take a dep-path
+        // suffix while debug's optional `supports-color` (which nothing on
+        // the path provides) bubbles up instead of binding to a cousin.
+        let is_optional = pkg
+            .peer_dependencies_meta
+            .get(peer_name)
+            .is_some_and(|m| m.optional);
+        let resolved = if is_optional {
+            from_ancestor.or(from_pkg_deps).or(from_root)
+        } else {
+            from_ancestor
+                .or(from_pkg_deps)
+                .or(from_ancestor_incompatible)
+                .or(from_pkg_deps_incompatible)
+                .or(from_root)
+                .or_else(from_graph_scan)
+                .or(from_root_incompatible)
+        };
+        if let Some(version) = resolved {
             peer_context.push((peer_name.clone(), version));
         }
     }
@@ -1814,4 +1832,92 @@ fn visit_peer_context<'g>(
         },
     );
     Some(contextualized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aube_lockfile::{DepType, DirectDep, PeerDepMeta};
+
+    fn locked(name: &str, deps: &[(&str, &str)]) -> LockedPackage {
+        LockedPackage {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            dep_path: format!("{name}@1.0.0"),
+            dependencies: deps
+                .iter()
+                .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// `root -> app -> {plugin, sibling}` and `sibling -> theme`. `theme`
+    /// is only ever a *cousin* of `plugin` (never an ancestor, the root,
+    /// or one of plugin's own deps), so the single way to reach it from
+    /// plugin's peer is the graph-wide scan.
+    fn graph_with_cousin_peer() -> LockfileGraph {
+        let mut g = LockfileGraph::default();
+        g.importers.insert(
+            ".".to_string(),
+            vec![DirectDep {
+                name: "app".to_string(),
+                dep_path: "app@1.0.0".to_string(),
+                dep_type: DepType::Production,
+                specifier: Some("1.0.0".to_string()),
+            }],
+        );
+        for p in [
+            locked("app", &[("plugin", "1.0.0"), ("sibling", "1.0.0")]),
+            locked("plugin", &[]),
+            locked("sibling", &[("theme", "1.0.0")]),
+            locked("theme", &[]),
+        ] {
+            g.packages.insert(p.dep_path.clone(), p);
+        }
+        g
+    }
+
+    #[test]
+    fn optional_peer_is_not_bound_via_graph_scan() {
+        let mut g = graph_with_cousin_peer();
+        let plugin = g.packages.get_mut("plugin@1.0.0").expect("plugin present");
+        plugin
+            .peer_dependencies
+            .insert("theme".to_string(), "*".to_string());
+        plugin
+            .peer_dependencies_meta
+            .insert("theme".to_string(), PeerDepMeta { optional: true });
+
+        let out = apply_peer_contexts(g, &PeerContextOptions::default()).expect("peer pass");
+
+        assert!(
+            out.packages.contains_key("plugin@1.0.0"),
+            "plugin keeps bare key"
+        );
+        assert!(
+            !out.packages.contains_key("plugin@1.0.0(theme@1.0.0)"),
+            "an optional peer reachable only via the graph scan must stay \
+             unresolved so it surfaces under transitivePeerDependencies"
+        );
+    }
+
+    #[test]
+    fn required_peer_still_binds_via_graph_scan() {
+        // Same shape, but `theme` is a *required* peer (no meta entry):
+        // the graph-wide scan still binds it, proving the narrowing above
+        // is specific to optional peers and not a regression.
+        let mut g = graph_with_cousin_peer();
+        let plugin = g.packages.get_mut("plugin@1.0.0").expect("plugin present");
+        plugin
+            .peer_dependencies
+            .insert("theme".to_string(), "*".to_string());
+
+        let out = apply_peer_contexts(g, &PeerContextOptions::default()).expect("peer pass");
+
+        assert!(
+            out.packages.contains_key("plugin@1.0.0(theme@1.0.0)"),
+            "a required peer should still resolve through the graph-wide scan"
+        );
+    }
 }

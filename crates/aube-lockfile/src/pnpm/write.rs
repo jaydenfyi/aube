@@ -199,10 +199,17 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                 }
             }
         };
-        let peer_deps = if pkg.peer_dependencies.is_empty() {
-            None
-        } else {
-            Some(pkg.peer_dependencies.clone())
+        // pnpm records a `peerDependencies: { x: '*' }` entry for every
+        // `peerDependenciesMeta` key a package declares without an explicit
+        // range (the classic case is debug's optional `supports-color`,
+        // shipped only under `peerDependenciesMeta`). `LockedPackage`'s
+        // helper folds those `*` ranges in so the packages entry matches
+        // pnpm byte-for-byte; doing it at write time keeps the optional
+        // peer out of peer-context resolution (which would bind it to an
+        // unrelated copy in the tree and grow spurious dep-path suffixes).
+        let peer_deps = {
+            let deps = pkg.peer_dependencies_with_meta_defaults();
+            if deps.is_empty() { None } else { Some(deps) }
         };
         let peer_meta = if pkg.peer_dependencies_meta.is_empty() {
             None
@@ -364,14 +371,30 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
             WritablePackageInfo {
                 resolution,
                 version: write_version,
-                engines: if pkg.engines.is_empty() {
-                    None
-                } else {
-                    Some(pkg.engines.clone())
+                // pnpm drops every engines entry whose value is exactly
+                // `*` and omits the field when nothing survives
+                // (updateLockfile.ts: `if (version === '*') continue`).
+                // Mirror that so e.g. `engines: {node: '*'}` never lands
+                // in the lockfile, while real constraints (including the
+                // array-shaped `{'0': node >=0.6.0}` pnpm keeps verbatim)
+                // are preserved.
+                engines: {
+                    let filtered: BTreeMap<String, String> = pkg
+                        .engines
+                        .iter()
+                        .filter(|(_, v)| v.as_str() != "*")
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    (!filtered.is_empty()).then_some(filtered)
                 },
-                os: pkg.os.to_vec(),
                 cpu: pkg.cpu.to_vec(),
+                os: pkg.os.to_vec(),
                 libc: pkg.libc.to_vec(),
+                deprecated: pkg
+                    .extra_meta
+                    .get("deprecated")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
                 has_bin: !pkg.bin.is_empty(),
                 peer_dependencies: peer_deps,
                 peer_dependencies_meta: peer_meta,
@@ -440,9 +463,10 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                 }),
                 version: Some(pin.version.clone()),
                 engines: None,
-                os: Vec::new(),
                 cpu: Vec::new(),
+                os: Vec::new(),
                 libc: Vec::new(),
+                deprecated: None,
                 has_bin: pin.has_bin,
                 peer_dependencies: None,
                 peer_dependencies_meta: None,
@@ -706,38 +730,42 @@ fn pruned_time_entries(
 struct WritablePnpmLockfile {
     lockfile_version: String,
     settings: WritableSettings,
-    // pnpm v9 places `overrides:` immediately after `settings:` and
-    // before `importers:`. Field order matters because we serialize
-    // through yaml_serde and want byte-for-byte parity with pnpm output
-    // for the no-overrides case (the field is skipped when empty).
+    /// pnpm v9 emits a top-level `catalogs:` map immediately after
+    /// `settings:` and before `overrides:` — see pnpm's
+    /// `sortLockfileKeys` ROOT_KEYS order (lockfileVersion, settings,
+    /// catalogs, overrides, packageExtensionsChecksum, pnpmfileChecksum,
+    /// patchedDependencies, importers, packages). Field order matters
+    /// because we serialize through yaml_serde and want byte-for-byte
+    /// parity with pnpm. Skipped when empty so a no-catalogs install
+    /// stays byte-identical to pnpm output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    catalogs: Option<BTreeMap<String, BTreeMap<String, WritableCatalogEntry>>>,
+    // pnpm v9 places `overrides:` after `catalogs:` and before
+    // `packageExtensionsChecksum:`. Field order matters because we
+    // serialize through yaml_serde and want byte-for-byte parity with
+    // pnpm output (the field is skipped when empty).
     #[serde(skip_serializing_if = "Option::is_none")]
     overrides: Option<BTreeMap<String, String>>,
     /// pnpm v9's top-level `packageExtensionsChecksum:` — emitted right
-    /// after `overrides:` (and before `patchedDependencies:`) when the
+    /// after `overrides:` and before `pnpmfileChecksum:` when the
     /// effective config declares any `packageExtensions`. Already
     /// carries pnpm's `sha256-` prefix. Skipped when absent so a
     /// no-extensions install stays byte-identical to pnpm.
     #[serde(skip_serializing_if = "Option::is_none")]
     package_extensions_checksum: Option<String>,
     /// pnpm v9's top-level `pnpmfileChecksum:` — emitted immediately
-    /// after `packageExtensionsChecksum:` when a local pnpmfile
-    /// participates. Skipped when absent for byte-identical output.
+    /// after `packageExtensionsChecksum:` and before
+    /// `patchedDependencies:` when a local pnpmfile participates.
+    /// Skipped when absent for byte-identical output.
     #[serde(skip_serializing_if = "Option::is_none")]
     pnpmfile_checksum: Option<String>,
     /// pnpm v9+ top-level `patchedDependencies:` — preserved so a
     /// bun→aube-lock conversion keeps the user's patches and a
     /// re-emit doesn't strip the block. pnpm emits this block right
-    /// after `overrides:` and before `catalogs:`, so the field order
-    /// here follows the same sequence for byte-identical output.
+    /// after `pnpmfileChecksum:` and before `importers:`, so the field
+    /// order here follows the same sequence for byte-identical output.
     #[serde(skip_serializing_if = "Option::is_none")]
     patched_dependencies: Option<BTreeMap<String, String>>,
-    /// pnpm v9 emits a top-level `catalogs:` map after
-    /// `overrides:` and before `importers:` when `pnpm-workspace.yaml`
-    /// declares any referenced catalog entries.
-    /// Skipped when empty so a no-catalogs install stays byte-identical
-    /// to pnpm output.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    catalogs: Option<BTreeMap<String, BTreeMap<String, WritableCatalogEntry>>>,
     /// pnpm v9 emits a top-level `time:` map when `resolution-mode=time-based`
     /// is active. Keyed by canonical `name@version`; values are ISO-8601
     /// publish timestamps pulled from the registry packument. Placed
@@ -894,20 +922,31 @@ struct WritablePackageInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
     /// pnpm writes `engines: {node: '>=8'}` in flow form immediately
-    /// after `resolution:` when the package declared any engines.
+    /// after `resolution:` when the package declared any engines —
+    /// minus entries whose value is exactly `*`, which pnpm drops (so a
+    /// manifest's `engines: {node: '*'}` yields no `engines:` line).
     /// Emitted as a block map here — `reformat_for_pnpm_parity` flips it
     /// to flow form to match pnpm byte-for-byte.
     #[serde(skip_serializing_if = "Option::is_none")]
     engines: Option<BTreeMap<String, String>>,
-    // pnpm v9 emits os/cpu/libc after `engines` and before `hasBin`.
-    // Keep this order to stay byte-identical with pnpm-written lockfiles
-    // for native packages.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    os: Vec<String>,
+    // pnpm v9 emits `cpu`, then `os`, then `libc` after `engines` and
+    // before `hasBin` (see pnpm's `sortLockfileKeys` ORDERED_KEYS:
+    // cpu=6, os=7, libc=8). Keep this order to stay byte-identical with
+    // pnpm-written lockfiles for native packages. `reformat_for_pnpm_parity`
+    // flips each of these block sequences to flow form (`cpu: [arm64]`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     cpu: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    os: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     libc: Vec<String>,
+    /// Registry deprecation reason. pnpm emits `deprecated: <reason>`
+    /// right after `cpu`/`os`/`libc` and before `hasBin` (verified
+    /// against pnpm v11 output for `request` / `coffee-script` /
+    /// `fsevents`). Skipped when absent so non-deprecated packages stay
+    /// byte-identical to pnpm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deprecated: Option<String>,
     /// pnpm emits `hasBin: true` only when the package has executables;
     /// `hasBin: false` is never written. Skip the default to match.
     #[serde(skip_serializing_if = "std::ops::Not::not")]

@@ -1539,6 +1539,10 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                     local_pnpmfile.as_deref(),
                 )
                 .await;
+                // Annotate the full (pre-host-filter) graph with pnpm-parity
+                // snapshot metadata (`optional: true`, `transitivePeerDependencies`)
+                // before the write and before the host-only `filter_graph` below.
+                crate::commands::prepare_resolved_graph_for_lockfile_write(&mut graph);
                 if shared_workspace_lockfile || !has_workspace {
                     let written_path = write_lockfile_dir_remapped(
                         &lockfile_dir,
