@@ -41,6 +41,10 @@ use std::sync::OnceLock;
 pub struct Embedder {
     /// Tool name, lowercase (e.g. `"aube"`). The proper noun users type and
     /// see in output, and the clap command name driving help/usage/errors.
+    /// Must be filesystem- and command-safe (no spaces, slashes, or shell
+    /// metacharacters); it is used verbatim in on-disk sidecar paths (e.g.
+    /// `.<name>_patch_state.json`, `.<name>-deploy-injected/`) and in command
+    /// invocations, so the embedder is responsible for supplying a safe slug.
     pub name: &'static str,
     /// High-visibility display name shown in the progress banner (e.g.
     /// `"aube"`). Usually equal to [`name`](Self::name); split out so an
@@ -85,9 +89,26 @@ pub struct Embedder {
     /// manifest **root** as top-level `package.json` keys — never under a
     /// foreign brand's namespace, and never as a literal `""` key.
     pub manifest_namespace: &'static str,
-    /// Env-var prefix for tool-specific variables, e.g. `Some("AUBE")` →
-    /// `AUBE_*`. `None` means the tool reads no branded env family.
+    /// Env-var prefix for the tool's *internal* debug / diagnostic / perf-bisect
+    /// toggles, read through [`embedder_env`](crate::env::embedder_env), e.g.
+    /// `Some("AUBE")` → `AUBE_DISABLE_CLONEDIR`, `AUBE_DIAG_PRINT`, … `None`
+    /// means the tool exposes *no* branded debug-toggle family — every such
+    /// toggle is simply unreadable, so an embedding host's brand never sprouts a
+    /// dozen `<HOST>_DISABLE_*` perf switches. This gates the non-settings,
+    /// non-user-facing toggle family only; the few user-facing config knobs go
+    /// through [`config_env_prefix`](Self::config_env_prefix), and the settings
+    /// table's branded aliases go through
+    /// [`branded_env_alias_enabled`](crate::env::branded_env_alias_enabled).
     pub env_prefix: Option<&'static str>,
+    /// Env-var prefix for the tool's small set of *first-class config* knobs —
+    /// the cache dir and the fetch concurrency — read through
+    /// [`config_env`](crate::env::config_env), e.g. `Some("AUBE")` →
+    /// `AUBE_CACHE_DIR` / `AUBE_CONCURRENCY`, `Some("NUB")` → `NUB_CACHE_DIR` /
+    /// `NUB_CONCURRENCY`. Distinct from [`env_prefix`](Self::env_prefix): these
+    /// few knobs ARE legitimate config the host wants under its own brand,
+    /// whereas the debug toggles vanish under an embedder that hides them.
+    /// `None` reads no first-class config env.
+    pub config_env_prefix: Option<&'static str>,
     /// Leaf directory name under the OS cache root, e.g. `"aube"` →
     /// `<XDG_CACHE_HOME>/aube`.
     pub cache_namespace: &'static str,
@@ -135,6 +156,7 @@ pub const AUBE: Embedder = Embedder {
     workspace_yaml: Some("aube-workspace.yaml"),
     manifest_namespace: "aube",
     env_prefix: Some("AUBE"),
+    config_env_prefix: Some("AUBE"),
     cache_namespace: "aube",
     data_namespace: "aube",
     canonical_lockfile_always_wins: true,
@@ -196,6 +218,47 @@ pub fn embedder() -> &'static Embedder {
     ACTIVE.get().copied().unwrap_or(&AUBE)
 }
 
+/// The active tool's program name for *user-facing* output — the proper noun a
+/// user types and reads (e.g. `"aube"` under the default profile, the host's
+/// brand under an embedder).
+///
+/// This is the source-branding seam jdx approved over post-processing rendered
+/// output: instead of an embedder string-rewriting `"aube"` out of finished
+/// banners and error text, user-facing emission sites compose the program name
+/// at the source via `prog()` / [`cmd`], so a library consumer (nub) gets its
+/// own brand without any post-pass. Use it for bare program-name references in
+/// `miette!` / `bail!` / `eprintln!` / `println!` strings (banners, "re-exec
+/// into pinned {prog} version", …). For an `aube <verb>` command reference use
+/// [`cmd`] instead, which also brands the verb's program prefix.
+///
+/// Default-preserving: under the default [`AUBE`] profile this returns exactly
+/// `"aube"` byte-for-byte, so standalone aube's output is unchanged. Returns
+/// [`Embedder::name`] — the command-safe slug, matching what the clap command
+/// name and on-disk sidecars already use, so a user reads one consistent name.
+pub fn prog() -> &'static str {
+    embedder().name
+}
+
+/// A *user-facing* `"{prog} <verb>"` command reference, e.g. `cmd("install")`
+/// renders `"aube install"` under the default profile and `"nub install"` under
+/// a `nub`-branded embedder.
+///
+/// Use this wherever a user-facing `miette!` / `bail!` / `eprintln!` /
+/// `println!` string tells the user to run a command — `"run `{}` first"` with
+/// `cmd("install")`, `"`{}`: package has no script"` with `cmd("run")`, help
+/// hints, and so on — so the program prefix follows the active brand instead of
+/// being hardcoded to `aube`. The `verb` is the command spelling exactly as the
+/// CLI accepts it (`"install"`, `"patch-commit"`, `"store prune"`); it is not
+/// re-branded, only the leading program name is.
+///
+/// Default-preserving: under the default [`AUBE`] profile `cmd("install")` is
+/// exactly `"aube install"` byte-for-byte, so standalone aube's error and help
+/// text is unchanged. Allocates a `String`; for the bare program name with no
+/// verb use [`prog`], which borrows.
+pub fn cmd(verb: &str) -> String {
+    format!("{} {verb}", prog())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,11 +286,29 @@ mod tests {
         assert_eq!(id.workspace_yaml, Some("aube-workspace.yaml"));
         assert_eq!(id.manifest_namespace, "aube");
         assert_eq!(id.env_prefix, Some("AUBE"));
+        assert_eq!(id.config_env_prefix, Some("AUBE"));
         assert_eq!(id.cache_namespace, "aube");
         assert_eq!(id.data_namespace, "aube");
         assert!(id.canonical_lockfile_always_wins);
         assert!(id.runtime_switching);
         assert!(id.self_engines_check);
         assert!(id.self_update_enabled);
+    }
+
+    /// Under the default (AUBE) profile the source-branding helpers reproduce
+    /// aube's hardcoded user-facing strings byte-for-byte: `prog()` is `"aube"`
+    /// and `cmd("install")` is `"aube install"`. This is the default-preserving
+    /// contract for the helpers jdx approved — converting a literal `"aube
+    /// install"` site to `cmd("install")` changes nothing for standalone aube.
+    /// (The non-aube branch — a host brand flowing through `prog`/`cmd` — is
+    /// covered by the `source_branding_brand_gate` integration test, which
+    /// registers a real profile in its own process; doing it here would flip
+    /// the process-global fallback the default-profile tests depend on.)
+    #[test]
+    fn prog_and_cmd_render_aube_under_default_profile() {
+        assert_eq!(prog(), "aube");
+        assert_eq!(cmd("install"), "aube install");
+        assert_eq!(cmd("patch-commit"), "aube patch-commit");
+        assert_eq!(cmd("store prune"), "aube store prune");
     }
 }

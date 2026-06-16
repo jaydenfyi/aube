@@ -5,8 +5,10 @@
 //! Mirrors `pnpm patch`. Two directories are created under a unique
 //! temp parent: `source/` (the original, immutable, used as the diff
 //! base) and `user/` (the writable copy printed to the user). A
-//! `.aube_patch_state.json` sidecar carries the package identity so
-//! `patch-commit` can locate the source dir given just the user dir.
+//! `.<name>_patch_state.json` sidecar (derived from the embedder name via
+//! `patch_state_filename()`; standalone aube: `.aube_patch_state.json`) carries
+//! the package identity so `patch-commit` can locate the source dir given just
+//! the user dir.
 
 use crate::patches::copy_dir_all;
 use clap::Args;
@@ -37,6 +39,14 @@ pub struct PatchArgs {
     /// this flag is effectively informational here.
     #[arg(long)]
     pub ignore_existing: bool,
+}
+
+/// The patch-state sidecar filename, derived from the active embedder's
+/// name: `.<name>_patch_state.json`. Standalone aube:
+/// `.aube_patch_state.json`. Used by both the writer (`run`) and the
+/// reader (`read_state`), so they stay paired.
+fn patch_state_filename() -> String {
+    format!(".{}_patch_state.json", aube_util::embedder().name)
 }
 
 pub async fn run(args: PatchArgs) -> Result<()> {
@@ -91,7 +101,7 @@ pub async fn run(args: PatchArgs) -> Result<()> {
         "project": cwd.display().to_string(),
     });
     std::fs::write(
-        parent.join(".aube_patch_state.json"),
+        parent.join(patch_state_filename()),
         serde_json::to_string_pretty(&state).unwrap(),
     )
     .into_diagnostic()
@@ -102,7 +112,8 @@ pub async fn run(args: PatchArgs) -> Result<()> {
         user_dir.display()
     );
     println!(
-        "Once you're done with your changes, run \"aube patch-commit '{}'\"",
+        "Once you're done with your changes, run \"{} '{}'\"",
+        aube_util::cmd("patch-commit"),
         user_dir.display()
     );
     Ok(())
@@ -164,15 +175,16 @@ fn find_pnpm_entry(
         }
     }
     Err(miette!(
-        "package {name}@{version} is not installed (looked under {}). Run `aube install` first.",
-        pnpm_dir.display()
+        "package {name}@{version} is not installed (looked under {}). Run `{}` first.",
+        pnpm_dir.display(),
+        aube_util::cmd("install")
     ))
 }
 
 fn parse_spec(input: &str) -> Result<(String, String)> {
     let (name, ver) = crate::commands::split_name_spec(input);
     let ver = ver.ok_or_else(|| {
-        miette!("`aube patch` requires `<name>@<version>` (got {input:?}); a bare name is ambiguous because the same package can be installed at multiple versions")
+        miette!("`{}` requires `<name>@<version>` (got {input:?}); a bare name is ambiguous because the same package can be installed at multiple versions", aube_util::cmd("patch"))
     })?;
     Ok((name.to_string(), ver.to_string()))
 }
@@ -189,20 +201,22 @@ fn default_edit_parent(name: &str, version: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Read the `.aube_patch_state.json` sidecar that `aube patch` writes
-/// next to a user-edit dir. `patch-commit` calls this to recover the
-/// package identity (name, version) and the matching source dir.
+/// Read the `.<name>_patch_state.json` sidecar (standalone aube:
+/// `.aube_patch_state.json`) that `patch` writes next to a user-edit dir.
+/// `patch-commit` calls this to recover the package identity (name, version)
+/// and the matching source dir.
 pub fn read_state(edit_dir: &Path) -> Result<PatchState> {
     let parent = edit_dir
         .parent()
         .ok_or_else(|| miette!("edit dir {} has no parent", edit_dir.display()))?;
-    let state_path = parent.join(".aube_patch_state.json");
+    let state_path = parent.join(patch_state_filename());
     let raw = std::fs::read_to_string(&state_path)
         .into_diagnostic()
         .map_err(|e| {
             miette!(
-                "{} is not a directory created by `aube patch` (no state sidecar: {e})",
-                edit_dir.display()
+                "{} is not a directory created by `{}` (no state sidecar: {e})",
+                edit_dir.display(),
+                aube_util::cmd("patch")
             )
         })?;
     let v: serde_json::Value = serde_json::from_str(&raw)

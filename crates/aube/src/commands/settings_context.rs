@@ -170,7 +170,8 @@ pub(crate) fn ensure_registry_auth(
         Ok(())
     } else {
         Err(miette!(
-            "no auth token for {registry_url}. Run `aube login --registry {registry_url}` first."
+            "no auth token for {registry_url}. Run `{} --registry {registry_url}` first.",
+            aube_util::cmd("login")
         ))
     }
 }
@@ -493,7 +494,10 @@ pub(crate) fn resolve_virtual_store_dir(
 ) -> std::path::PathBuf {
     let default_from_modules_dir = || {
         let modules_dir = aube_settings::resolved::modules_dir(ctx);
-        project_dir.join(modules_dir).join(".aube")
+        // Virtual-store leaf from the active embedder's name: `.<name>`.
+        // Standalone aube → `.aube`.
+        let leaf = format!(".{}", aube_util::embedder().name);
+        project_dir.join(modules_dir).join(leaf)
     };
     let has_explicit_npmrc = [
         ctx.project_aube_config,

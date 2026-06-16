@@ -263,10 +263,17 @@ fn random_byte() -> u8 {
 }
 
 fn primer_cache_dir() -> Option<PathBuf> {
-    if let Some(base) = std::env::var_os("AUBE_CACHE_DIR") {
+    // First-class config knob, read under the active embedder's brand
+    // (`AUBE_CACHE_DIR` for standalone aube, `<BRAND>_CACHE_DIR` for an embedder
+    // with its own `config_env_prefix`) via `config_env` — never the branded
+    // `AUBE_*` form under such a host.
+    if let Some(base) = aube_util::env::config_env("CACHE_DIR") {
         return Some(PathBuf::from(base).join("primer"));
     }
-    cache_base_dir().map(|p| p.join("aube").join("primer"))
+    // Active embedder's `cache_namespace` (standalone aube → "aube"), not a literal,
+    // so the primer lands beside the packument cache in aube-store's `cache_dir`
+    // rather than under an aube-named path in a host embedder's $XDG_CACHE.
+    cache_base_dir().map(|p| p.join(aube_util::embedder().cache_namespace).join("primer"))
 }
 
 #[cfg(unix)]
