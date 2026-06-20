@@ -246,6 +246,7 @@ pub enum LinkStrategy {
 pub struct LinkStats {
     pub packages_linked: usize,
     pub packages_cached: usize,
+    pub packages_clonefiled: usize,
     pub files_linked: usize,
     pub top_level_linked: usize,
     /// Populated only when the linker ran in `NodeLinker::Hoisted`
