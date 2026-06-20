@@ -315,6 +315,24 @@ impl Linker {
             .join(pkg_name)
     }
 
+    /// Path to a package's own files in the per-project `.aube/`
+    /// virtual store: `<aube_dir>/<entry>/node_modules/<pkg_name>/`.
+    /// Symmetric with [`gvs_package_dir`](Self::gvs_package_dir) but
+    /// rooted under the project's local store instead of the global
+    /// one. Used by the hoisted linker's clonefile fast path as the
+    /// secondary source when no GVS entry exists.
+    pub(crate) fn aube_package_dir(
+        &self,
+        root_dir: &Path,
+        dep_path: &str,
+        pkg_name: &str,
+    ) -> PathBuf {
+        self.aube_dir_for(root_dir)
+            .join(self.aube_dir_entry_name(dep_path))
+            .join("node_modules")
+            .join(pkg_name)
+    }
+
     /// Directory name for `dep_path` inside a project's local
     /// `node_modules/.aube/`. Same filename-bounding as the global
     /// store, but without the graph-hash fold — local `.aube/` is

@@ -501,11 +501,7 @@ fn link_hoisted_package(
     // inside the source by `materialize_into`, so clonefile copies
     // the patched bytes — no separate patch pass needed.
     let gvs_entry = linker.gvs_package_dir(dep_path, &pkg.name);
-    let local_entry = linker
-        .aube_dir_for(root_dir)
-        .join(linker.aube_dir_entry_name(dep_path))
-        .join("node_modules")
-        .join(&pkg.name);
+    let local_entry = linker.aube_package_dir(root_dir, dep_path, &pkg.name);
     let clonefile_source = if gvs_entry.exists() {
         Some(gvs_entry)
     } else if local_entry.exists() {
