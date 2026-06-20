@@ -958,7 +958,7 @@ fn hoisted_clonefile_from_aube_entry() {
 }
 
 #[test]
-fn hoisted_per_file_fallback_without_aube_entry() {
+fn hoisted_on_demand_gvs_populate_then_clonefile() {
     let dir = tempfile::tempdir().unwrap();
     let (store, indices) = setup_store_with_files(dir.path());
     let graph = make_graph();
@@ -966,7 +966,8 @@ fn hoisted_per_file_fallback_without_aube_entry() {
 
     let linker = Linker::new(&store, LinkStrategy::Copy).with_node_linker(NodeLinker::Hoisted);
 
-    // No .aube/ entries — per-file fallback must link everything.
+    // No GVS or .aube/ entries — the linker must populate the GVS
+    // on-demand from CAS, then clonefile into node_modules.
     let stats = linker.link_all(&project_dir, &graph, &indices).unwrap();
 
     let nm = project_dir.join("node_modules");
@@ -982,8 +983,74 @@ fn hoisted_per_file_fallback_without_aube_entry() {
         std::fs::read_to_string(nm.join("bar/index.js")).unwrap(),
         "module.exports = 'bar';"
     );
-    assert_eq!(stats.packages_clonefiled, 0);
-    assert!(stats.packages_linked >= 2);
+
+    // On APFS (macOS), on-demand populate + clonefile should succeed.
+    // On other platforms the per-file fallback runs — both produce
+    // identical trees.
+    if cfg!(target_os = "macos") {
+        assert!(
+            stats.packages_clonefiled >= 2,
+            "expected clonefile on macOS after on-demand GVS populate, \
+             got {} clonefiled",
+            stats.packages_clonefiled
+        );
+    }
+
+    // The GVS entry must now exist so subsequent installs hit the
+    // fast path without re-populating.
+    let foo_gvs = linker.gvs_package_dir("foo@1.0.0", "foo");
+    assert!(
+        foo_gvs.exists(),
+        "GVS entry for foo@1.0.0 must exist after on-demand populate"
+    );
+    assert!(
+        foo_gvs.join("index.js").exists(),
+        "GVS entry for foo@1.0.0 must contain index.js"
+    );
+
+    let bar_gvs = linker.gvs_package_dir("bar@2.0.0", "bar");
+    assert!(
+        bar_gvs.exists(),
+        "GVS entry for bar@2.0.0 must exist after on-demand populate"
+    );
+}
+
+#[test]
+fn hoisted_second_install_uses_gvs_fast_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, indices) = setup_store_with_files(dir.path());
+    let graph = make_graph();
+    let project_dir = dir.path().join("project");
+
+    let linker = Linker::new(&store, LinkStrategy::Copy).with_node_linker(NodeLinker::Hoisted);
+
+    // First install: populates GVS on-demand.
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    // Wipe node_modules to simulate a fresh install.
+    std::fs::remove_dir_all(project_dir.join("node_modules")).unwrap();
+
+    // Second install: GVS entries already exist — clonefile directly.
+    let stats = linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    let nm = project_dir.join("node_modules");
+    assert_eq!(
+        std::fs::read_to_string(nm.join("foo/index.js")).unwrap(),
+        "module.exports = 'foo';"
+    );
+    assert_eq!(
+        std::fs::read_to_string(nm.join("bar/index.js")).unwrap(),
+        "module.exports = 'bar';"
+    );
+
+    if cfg!(target_os = "macos") {
+        assert!(
+            stats.packages_clonefiled >= 2,
+            "second install should clonefile from existing GVS entries, \
+             got {} clonefiled",
+            stats.packages_clonefiled
+        );
+    }
 }
 
 #[cfg(windows)]

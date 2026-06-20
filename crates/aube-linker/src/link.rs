@@ -27,6 +27,7 @@ impl Linker {
         if matches!(self.node_linker, NodeLinker::Hoisted) {
             let mut stats = LinkStats::default();
             let mut placements = HoistedPlacements::default();
+            let nested_link_targets = build_nested_link_targets(project_dir, graph);
             hoisted::link_hoisted_importer(
                 self,
                 hoisted::HoistedImporterDirs {
@@ -36,6 +37,7 @@ impl Linker {
                 graph.root_deps(),
                 graph,
                 package_indices,
+                nested_link_targets.as_ref(),
                 &mut stats,
                 &mut placements,
             )?;
@@ -558,6 +560,7 @@ impl Linker {
     ) -> Result<LinkStats, Error> {
         let mut stats = LinkStats::default();
         let mut placements = HoistedPlacements::default();
+        let nested_link_targets = build_nested_link_targets(root_dir, graph);
         for (importer_path, deps) in &graph.importers {
             if !is_physical_importer(importer_path) {
                 continue;
@@ -603,6 +606,7 @@ impl Linker {
                 &planner_deps,
                 graph,
                 package_indices,
+                nested_link_targets.as_ref(),
                 &mut stats,
                 &mut placements,
             )?;

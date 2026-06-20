@@ -355,12 +355,14 @@ pub(crate) struct HoistedImporterDirs<'a> {
     pub(crate) importer: &'a Path,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn link_hoisted_importer(
     linker: &Linker,
     dirs: HoistedImporterDirs<'_>,
     root_deps: &[DirectDep],
     graph: &LockfileGraph,
     package_indices: &BTreeMap<String, PackageIndex>,
+    nested_link_targets: Option<&BTreeMap<String, PathBuf>>,
     stats: &mut LinkStats,
     placements: &mut HoistedPlacements,
 ) -> Result<(), Error> {
@@ -459,7 +461,33 @@ pub(crate) fn link_hoisted_importer(
                 } else if local_entry.exists() {
                     Some(local_entry)
                 } else {
-                    None
+                    // No prewarmed source — populate the GVS entry
+                    // on-demand from CAS shards, then clonefile from
+                    // it. First install pays per-file materialization
+                    // into GVS; subsequent installs hit the
+                    // gvs_entry.exists() fast path above.
+                    //
+                    // Stats are discarded: the clonefile below is the
+                    // real link step and reports its own counts.
+                    // Counting here too would double files_linked.
+                    let mut gvs_stats = LinkStats::default();
+                    match linker.ensure_in_virtual_store(
+                        dep_path,
+                        pkg,
+                        index,
+                        &mut gvs_stats,
+                        nested_link_targets,
+                    ) {
+                        Ok(()) => Some(gvs_entry),
+                        Err(e) => {
+                            trace!(
+                                "on-demand GVS populate for {} \
+                                 failed, falling back to per-file: {e}",
+                                dep_path
+                            );
+                            None
+                        }
+                    }
                 };
                 if let Some(src) = clonefile_source.as_ref() {
                     if let Some(parent) = pkg_dir.parent() {
