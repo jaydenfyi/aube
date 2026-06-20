@@ -1,0 +1,21 @@
+crates/aube-linker/src/builder.rs
+  s_eda7f613b9dfd5::t_b6e7aa45ec4330 318-335
+crates/aube-linker/src/hoisted.rs
+  s_eda7f613b9dfd5::t_cb07bb716e4f73 504
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "8909661dcfd38c89fe5f9b1e1b2b31c6ac8b6094",
+  "prompts": {},
+  "sessions": {
+    "s_eda7f613b9dfd5": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_11d4d75edffeFdwDbmZYKjkC1a",
+        "model": "glm-5.2"
+      },
+      "human_author": "jaydenfyi <213395523+jaydenfyi@users.noreply.github.com>"
+    }
+  }
+}
