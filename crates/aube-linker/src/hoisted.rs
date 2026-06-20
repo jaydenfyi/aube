@@ -404,152 +404,16 @@ pub(crate) fn link_hoisted_importer(
         work_items
             .par_iter()
             .map(|(dep_path, pkg_dir)| {
-                let mut local_stats = LinkStats::default();
-                let mut local_placements: Vec<(String, PathBuf)> = Vec::new();
-
-                let Some(pkg) = graph.packages.get(dep_path) else {
-                    return Ok((local_stats, local_placements));
-                };
-
-                // `link:` deps: symlink the package dir straight at
-                // the target. `portal:` packages stay on the
-                // materialized path so their graph-visible deps
-                // are linked like Yarn expects.
-                if let Some(LocalSource::Link(rel)) = pkg.local_source.as_ref() {
-                    if let Some(parent) = pkg_dir.parent() {
-                        crate::mkdirp(parent)?;
-                    }
-                    crate::try_remove_entry(pkg_dir);
-                    let abs_target = root_dir.join(rel);
-                    let link_parent = pkg_dir.parent().unwrap_or(&nm);
-                    let rel_target =
-                        pathdiff::diff_paths(&abs_target, link_parent).unwrap_or(abs_target);
-                    crate::sys::create_dir_link(&rel_target, pkg_dir)
-                        .map_err(|e| Error::Io(pkg_dir.clone(), e))?;
-                    local_placements.push((dep_path.clone(), pkg_dir.clone()));
-                    return Ok((local_stats, local_placements));
-                }
-
-                // Registry (or `file:`) package — needs a
-                // PackageIndex to find the store-backed file set.
-                let owned_index;
-                let index = match package_indices.get(dep_path) {
-                    Some(i) => i,
-                    None => {
-                        let loaded = linker
-                            .store
-                            .load_index(pkg.registry_name(), &pkg.version, pkg.integrity.as_deref())
-                            .ok_or_else(|| Error::MissingPackageIndex(dep_path.clone()))?;
-                        owned_index = loaded;
-                        &owned_index
-                    }
-                };
-
-                // Wipe any previous contents at this path.
-                crate::try_remove_entry(pkg_dir);
-
-                // Fast path: clonefile the entire package directory
-                // from a prewarm-populated source entry.
-                let gvs_entry = linker.gvs_package_dir(dep_path, &pkg.name);
-                let local_entry = linker
-                    .aube_dir_for(root_dir)
-                    .join(linker.aube_dir_entry_name(dep_path))
-                    .join("node_modules")
-                    .join(&pkg.name);
-                let clonefile_source = if gvs_entry.exists() {
-                    Some(gvs_entry)
-                } else if local_entry.exists() {
-                    Some(local_entry)
-                } else {
-                    // No prewarmed source — populate the GVS entry
-                    // on-demand from CAS shards, then clonefile from
-                    // it. First install pays per-file materialization
-                    // into GVS; subsequent installs hit the
-                    // gvs_entry.exists() fast path above.
-                    //
-                    // Stats are discarded: the clonefile below is the
-                    // real link step and reports its own counts.
-                    // Counting here too would double files_linked.
-                    let mut gvs_stats = LinkStats::default();
-                    match linker.ensure_in_virtual_store(
-                        dep_path,
-                        pkg,
-                        index,
-                        &mut gvs_stats,
-                        nested_link_targets,
-                    ) {
-                        Ok(()) => Some(gvs_entry),
-                        Err(e) => {
-                            trace!(
-                                "on-demand GVS populate for {} \
-                                 failed, falling back to per-file: {e}",
-                                dep_path
-                            );
-                            None
-                        }
-                    }
-                };
-                if let Some(src) = clonefile_source.as_ref() {
-                    if let Some(parent) = pkg_dir.parent() {
-                        crate::mkdirp(parent)?;
-                    }
-                    match reflink_copy::reflink(src, pkg_dir) {
-                        Ok(()) => {
-                            local_stats.files_linked += index.len();
-                            local_stats.packages_linked += 1;
-                            local_stats.packages_clonefiled += 1;
-                            local_placements.push((dep_path.clone(), pkg_dir.clone()));
-                            return Ok((local_stats, local_placements));
-                        }
-                        Err(e) => {
-                            trace!(
-                                "clonefile {} -> {} failed, \
-                                     falling back to per-file: {e}",
-                                src.display(),
-                                pkg_dir.display()
-                            );
-                        }
-                    }
-                }
-
-                // Fallback: serial per-file hardlink/reflink/copy.
-                let mut parents: BTreeSet<PathBuf> = BTreeSet::new();
-                parents.insert(pkg_dir.clone());
-                for rel_path in index.keys() {
-                    crate::validate_index_key(rel_path)?;
-                    let target = pkg_dir.join(rel_path);
-                    if let Some(parent) = target.parent() {
-                        parents.insert(parent.to_path_buf());
-                    }
-                }
-                for parent in &parents {
-                    std::fs::create_dir_all(parent).map_err(|e| Error::Io(parent.clone(), e))?;
-                }
-
-                for (rel_path, stored) in index {
-                    let target = pkg_dir.join(rel_path);
-                    if let Err(e) = linker.link_file_fresh(stored, rel_path, &target) {
-                        if let Error::MissingStoreFile { .. } = &e {
-                            crate::invalidate_stale_index_for_package(&linker.store, pkg);
-                        }
-                        return Err(e);
-                    }
-                    local_stats.files_linked += 1;
-                    if stored.executable {
-                        #[cfg(unix)]
-                        xx::file::make_executable(&target).map_err(|e| Error::Xx(e.to_string()))?;
-                    }
-                }
-
-                let patch_key = pkg.spec_key();
-                if let Some(patch_text) = linker.patches.get(&patch_key) {
-                    apply_multi_file_patch(pkg_dir, patch_text)
-                        .map_err(|msg| Error::Patch(patch_key.clone(), msg))?;
-                }
-
-                local_stats.packages_linked += 1;
-                local_placements.push((dep_path.clone(), pkg_dir.clone()));
-                Ok((local_stats, local_placements))
+                link_hoisted_package(
+                    linker,
+                    dep_path,
+                    pkg_dir,
+                    root_dir,
+                    &nm,
+                    graph,
+                    package_indices,
+                    nested_link_targets,
+                )
             })
             .collect()
     });
@@ -567,6 +431,174 @@ pub(crate) fn link_hoisted_importer(
 
     stats.top_level_linked += plan.nodes[plan.root_idx].children.len();
     Ok(())
+}
+
+/// Link a single non-root package into its planned hoisted position.
+///
+/// Called in parallel from `link_hoisted_importer`'s rayon pool. Each
+/// call writes into its own `pkg_dir` — tasks are independent because
+/// every package's files land in a unique directory.
+///
+/// Returns local stats and a placements vec (0 or 1 entries) for the
+/// caller to merge after the pool joins.
+#[allow(clippy::too_many_arguments)]
+fn link_hoisted_package(
+    linker: &Linker,
+    dep_path: &str,
+    pkg_dir: &Path,
+    root_dir: &Path,
+    nm: &Path,
+    graph: &LockfileGraph,
+    package_indices: &BTreeMap<String, PackageIndex>,
+    nested_link_targets: Option<&BTreeMap<String, PathBuf>>,
+) -> Result<(LinkStats, Vec<(String, PathBuf)>), Error> {
+    let mut local_stats = LinkStats::default();
+    let mut local_placements: Vec<(String, PathBuf)> = Vec::new();
+
+    let Some(pkg) = graph.packages.get(dep_path) else {
+        return Ok((local_stats, local_placements));
+    };
+
+    // `link:` deps: symlink the package dir straight at the target.
+    // `portal:` packages stay on the materialized path so their
+    // graph-visible deps are linked like Yarn expects.
+    if let Some(LocalSource::Link(rel)) = pkg.local_source.as_ref() {
+        if let Some(parent) = pkg_dir.parent() {
+            crate::mkdirp(parent)?;
+        }
+        crate::try_remove_entry(pkg_dir);
+        let abs_target = root_dir.join(rel);
+        let link_parent = pkg_dir.parent().unwrap_or(nm);
+        let rel_target = pathdiff::diff_paths(&abs_target, link_parent).unwrap_or(abs_target);
+        crate::sys::create_dir_link(&rel_target, pkg_dir)
+            .map_err(|e| Error::Io(pkg_dir.to_path_buf(), e))?;
+        local_placements.push((dep_path.to_string(), pkg_dir.to_path_buf()));
+        return Ok((local_stats, local_placements));
+    }
+
+    // Registry (or `file:`) package — needs a PackageIndex to find
+    // the store-backed file set. `package_indices` is sparse on warm
+    // installs, so lazy-load from the store on miss.
+    let owned_index;
+    let index = match package_indices.get(dep_path) {
+        Some(i) => i,
+        None => {
+            let loaded = linker
+                .store
+                .load_index(pkg.registry_name(), &pkg.version, pkg.integrity.as_deref())
+                .ok_or_else(|| Error::MissingPackageIndex(dep_path.to_string()))?;
+            owned_index = loaded;
+            &owned_index
+        }
+    };
+
+    // Wipe any previous contents at this path so a re-run after
+    // changing versions doesn't leave stale files behind.
+    crate::try_remove_entry(pkg_dir);
+
+    // Fast path: clonefile the entire package directory from a
+    // prewarm-populated source entry. Patches are already applied
+    // inside the source by `materialize_into`, so clonefile copies
+    // the patched bytes — no separate patch pass needed.
+    let gvs_entry = linker.gvs_package_dir(dep_path, &pkg.name);
+    let local_entry = linker
+        .aube_dir_for(root_dir)
+        .join(linker.aube_dir_entry_name(dep_path))
+        .join("node_modules")
+        .join(&pkg.name);
+    let clonefile_source = if gvs_entry.exists() {
+        Some(gvs_entry)
+    } else if local_entry.exists() {
+        Some(local_entry)
+    } else {
+        // No prewarmed source — populate the GVS entry on-demand
+        // from CAS shards, then clonefile from it. First install
+        // pays per-file materialization into GVS; subsequent
+        // installs hit the `gvs_entry.exists()` fast path above.
+        //
+        // Stats are discarded: the clonefile below is the real link
+        // step and reports its own counts. Counting here too would
+        // double files_linked.
+        let mut gvs_stats = LinkStats::default();
+        match linker.ensure_in_virtual_store(
+            dep_path,
+            pkg,
+            index,
+            &mut gvs_stats,
+            nested_link_targets,
+        ) {
+            Ok(()) => Some(gvs_entry),
+            Err(e) => {
+                trace!(
+                    "on-demand GVS populate for {} failed, falling back to per-file: {e}",
+                    dep_path
+                );
+                None
+            }
+        }
+    };
+    if let Some(src) = clonefile_source.as_ref() {
+        if let Some(parent) = pkg_dir.parent() {
+            crate::mkdirp(parent)?;
+        }
+        match reflink_copy::reflink(src, pkg_dir) {
+            Ok(()) => {
+                local_stats.files_linked += index.len();
+                local_stats.packages_linked += 1;
+                local_stats.packages_clonefiled += 1;
+                local_placements.push((dep_path.to_string(), pkg_dir.to_path_buf()));
+                return Ok((local_stats, local_placements));
+            }
+            Err(e) => {
+                trace!(
+                    "clonefile {} -> {} failed, falling back to per-file: {e}",
+                    src.display(),
+                    pkg_dir.display()
+                );
+            }
+        }
+    }
+
+    // Fallback: serial per-file hardlink/reflink/copy. Validate every
+    // key once here — the file-linking loop walks the same immutable
+    // index, so skipping the check there is safe.
+    let mut parents: BTreeSet<PathBuf> = BTreeSet::new();
+    parents.insert(pkg_dir.to_path_buf());
+    for rel_path in index.keys() {
+        crate::validate_index_key(rel_path)?;
+        let target = pkg_dir.join(rel_path);
+        if let Some(parent) = target.parent() {
+            parents.insert(parent.to_path_buf());
+        }
+    }
+    for parent in &parents {
+        std::fs::create_dir_all(parent).map_err(|e| Error::Io(parent.clone(), e))?;
+    }
+
+    for (rel_path, stored) in index {
+        let target = pkg_dir.join(rel_path);
+        if let Err(e) = linker.link_file_fresh(stored, rel_path, &target) {
+            if let Error::MissingStoreFile { .. } = &e {
+                crate::invalidate_stale_index_for_package(&linker.store, pkg);
+            }
+            return Err(e);
+        }
+        local_stats.files_linked += 1;
+        if stored.executable {
+            #[cfg(unix)]
+            xx::file::make_executable(&target).map_err(|e| Error::Xx(e.to_string()))?;
+        }
+    }
+
+    let patch_key = pkg.spec_key();
+    if let Some(patch_text) = linker.patches.get(&patch_key) {
+        apply_multi_file_patch(pkg_dir, patch_text)
+            .map_err(|msg| Error::Patch(patch_key.clone(), msg))?;
+    }
+
+    local_stats.packages_linked += 1;
+    local_placements.push((dep_path.to_string(), pkg_dir.to_path_buf()));
+    Ok((local_stats, local_placements))
 }
 
 #[cfg(test)]
