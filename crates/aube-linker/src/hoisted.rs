@@ -46,6 +46,7 @@ use aube_lockfile::{DirectDep, LocalSource, LockfileGraph};
 use aube_store::PackageIndex;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use tracing::trace;
 
 /// Map from lockfile `dep_path` to the absolute on-disk directories
 /// where that package ended up. Most entries have exactly one path;
@@ -450,10 +451,60 @@ pub(crate) fn link_hoisted_importer(
         };
 
         // Wipe any previous contents at this path so a re-run after
-        // changing versions doesn't leave stale files behind, then
-        // batch-create every intermediate parent directory the index
-        // will write into.
+        // changing versions doesn't leave stale files behind.
         crate::try_remove_entry(&pkg_dir);
+
+        // Fast path: clonefile the entire package directory from a
+        // prewarm-populated source entry. One clonefileat() on macOS
+        // APFS recursively CoW-clones every file in the package —
+        // replaces ~67 mean per-file hardlink syscalls with 1. The
+        // prewarm creates entries either in the global virtual store
+        // (GVS on, default for local dev) or per-project .aube/
+        // (GVS off, CI mode). Check both; whichever exists is the
+        // one the prewarm populated. Patches are already applied
+        // inside the entry, and dependency symlinks live at the
+        // sibling level (not inside <pkg.name>/), so the clone brings
+        // patched bytes and nothing extra.
+        let gvs_entry = linker.gvs_package_dir(&dep_path, &pkg.name);
+        let local_entry = linker
+            .aube_dir_for(root_dir)
+            .join(linker.aube_dir_entry_name(&dep_path))
+            .join("node_modules")
+            .join(&pkg.name);
+        let clonefile_source = if gvs_entry.exists() {
+            Some(gvs_entry)
+        } else if local_entry.exists() {
+            Some(local_entry)
+        } else {
+            None
+        };
+        if let Some(src) = clonefile_source.as_ref() {
+            if let Some(parent) = pkg_dir.parent() {
+                crate::mkdirp(parent)?;
+            }
+            match reflink_copy::reflink(src, &pkg_dir) {
+                Ok(()) => {
+                    stats.files_linked += index.len();
+                    stats.packages_linked += 1;
+                    stats.packages_clonefiled += 1;
+                    placements.record(&dep_path, pkg_dir);
+                    continue;
+                }
+                Err(e) => {
+                    trace!(
+                        "clonefile {} -> {} failed, falling back to per-file: {e}",
+                        src.display(),
+                        pkg_dir.display()
+                    );
+                    // clonefile failed = no destination created. Fall
+                    // through to the per-file loop below.
+                }
+            }
+        }
+
+        // Fallback: serial per-file hardlink/reflink/copy loop.
+        // Batch-create every intermediate parent directory the index
+        // will write into.
         let mut parents: BTreeSet<PathBuf> = BTreeSet::new();
         parents.insert(pkg_dir.clone());
         // Validate every key once here. The file-linking loop below

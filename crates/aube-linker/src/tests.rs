@@ -900,6 +900,92 @@ fn validate_index_key_rejects_nul_and_backslash() {
     ));
 }
 
+#[test]
+fn hoisted_clonefile_from_aube_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, indices) = setup_store_with_files(dir.path());
+    let graph = make_graph();
+    let project_dir = dir.path().join("project");
+
+    let linker = Linker::new(&store, LinkStrategy::Copy).with_node_linker(NodeLinker::Hoisted);
+
+    // Populate .aube/ entries as the prewarm materializer would.
+    let aube_dir = linker.aube_dir_for(&project_dir);
+    let foo_src = aube_dir
+        .join(linker.aube_dir_entry_name("foo@1.0.0"))
+        .join("node_modules")
+        .join("foo");
+    std::fs::create_dir_all(&foo_src).unwrap();
+    std::fs::write(foo_src.join("index.js"), b"module.exports = 'foo';").unwrap();
+    std::fs::write(
+        foo_src.join("package.json"),
+        b"{\"name\":\"foo\",\"version\":\"1.0.0\"}",
+    )
+    .unwrap();
+
+    let bar_src = aube_dir
+        .join(linker.aube_dir_entry_name("bar@2.0.0"))
+        .join("node_modules")
+        .join("bar");
+    std::fs::create_dir_all(&bar_src).unwrap();
+    std::fs::write(bar_src.join("index.js"), b"module.exports = 'bar';").unwrap();
+
+    let stats = linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    let nm = project_dir.join("node_modules");
+    assert_eq!(
+        std::fs::read_to_string(nm.join("foo/index.js")).unwrap(),
+        "module.exports = 'foo';"
+    );
+    assert_eq!(
+        std::fs::read_to_string(nm.join("foo/package.json")).unwrap(),
+        "{\"name\":\"foo\",\"version\":\"1.0.0\"}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(nm.join("bar/index.js")).unwrap(),
+        "module.exports = 'bar';"
+    );
+
+    // On APFS (macOS), clonefile should succeed. On other platforms
+    // the per-file fallback runs — both produce identical trees.
+    if cfg!(target_os = "macos") {
+        assert!(
+            stats.packages_clonefiled >= 2,
+            "expected clonefile on macOS, got {} clonefiled",
+            stats.packages_clonefiled
+        );
+    }
+}
+
+#[test]
+fn hoisted_per_file_fallback_without_aube_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, indices) = setup_store_with_files(dir.path());
+    let graph = make_graph();
+    let project_dir = dir.path().join("project");
+
+    let linker = Linker::new(&store, LinkStrategy::Copy).with_node_linker(NodeLinker::Hoisted);
+
+    // No .aube/ entries — per-file fallback must link everything.
+    let stats = linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    let nm = project_dir.join("node_modules");
+    assert_eq!(
+        std::fs::read_to_string(nm.join("foo/index.js")).unwrap(),
+        "module.exports = 'foo';"
+    );
+    assert_eq!(
+        std::fs::read_to_string(nm.join("foo/package.json")).unwrap(),
+        "{\"name\":\"foo\",\"version\":\"1.0.0\"}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(nm.join("bar/index.js")).unwrap(),
+        "module.exports = 'bar';"
+    );
+    assert_eq!(stats.packages_clonefiled, 0);
+    assert!(stats.packages_linked >= 2);
+}
+
 #[cfg(windows)]
 #[test]
 fn validate_index_key_rejects_windows_drive() {

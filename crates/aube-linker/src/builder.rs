@@ -303,6 +303,18 @@ impl Linker {
         dep_path_to_filename(&hashed, self.virtual_store_dir_max_length)
     }
 
+    /// Path to a package's own files in the global virtual store:
+    /// `<gvs>/<subdir>/node_modules/<pkg_name>/`. The directory
+    /// contains only the package's files (patches applied, executable
+    /// bits set); dependency symlinks live at the sibling level and
+    /// are excluded. Used by the hoisted linker's clonefile fast path.
+    pub(crate) fn gvs_package_dir(&self, dep_path: &str, pkg_name: &str) -> PathBuf {
+        self.virtual_store
+            .join(self.virtual_store_subdir(dep_path))
+            .join("node_modules")
+            .join(pkg_name)
+    }
+
     /// Directory name for `dep_path` inside a project's local
     /// `node_modules/.aube/`. Same filename-bounding as the global
     /// store, but without the graph-hash fold — local `.aube/` is
