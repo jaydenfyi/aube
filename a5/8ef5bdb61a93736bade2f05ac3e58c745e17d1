@@ -1,0 +1,27 @@
+crates/aube-linker/src/hoisted.rs
+  s_eda7f613b9dfd5::t_6617ec03ac49c7 365
+  s_eda7f613b9dfd5::t_273f19ddf23ae4 464-490
+  s_eda7f613b9dfd5::t_442d4feeec5fee 358
+crates/aube-linker/src/link.rs
+  s_eda7f613b9dfd5::t_e5fe8217832622 30,40
+  s_eda7f613b9dfd5::t_916fac79e92f69 563
+crates/aube-linker/src/tests.rs
+  s_eda7f613b9dfd5::t_5e4205b76b91ca 961,969-970,986-1015
+  s_eda7f613b9dfd5::t_d82b56a7d4d308 1018-1053
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "a58ef5bdb61a93736bade2f05ac3e58c745e17d1",
+  "prompts": {},
+  "sessions": {
+    "s_eda7f613b9dfd5": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_11d4d75edffeFdwDbmZYKjkC1a",
+        "model": "glm-5.2"
+      },
+      "human_author": "jaydenfyi <213395523+jaydenfyi@users.noreply.github.com>"
+    }
+  }
+}
